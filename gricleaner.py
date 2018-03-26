@@ -40,10 +40,6 @@ class GitlabRegistryClient(object):
         else:
             response.raise_for_status()
 
-    def get_catalog(self):
-        """Return catalog of repositories from registry"""
-        return self.get_json("/v2/_catalog", "registry:catalog")["repositories"]
-
     def get_tags(self, repo):
         """Return tags of repository from registry"""
         return self.get_json("/v2/{}/tags/list".format(repo),
@@ -86,7 +82,8 @@ class GitlabRegistryClient(object):
                 "Authorization": "Bearer " + self.get_bearer("repository:" + repo)
             }
             response = requests.delete(self.registry + url, headers=headers, verify=self.requests_verify)
-            if response.status_code == 202:
+            # We allow 404 in case there is a race between 2 deletes
+            if response.status_code in (202, 404):
                 logging.info("+ OK")
             else:
                 logging.error(response.text)
@@ -94,50 +91,39 @@ class GitlabRegistryClient(object):
 
 if __name__ == "__main__":
     import argparse
-    import configparser
     import datetime
-    import dateutil.parser
     import os
-    import sys
 
     config_name = os.path.basename(__file__).replace(".py", ".ini")
     parser = argparse.ArgumentParser(
         description="Utility to remove Docker images from the Gitlab registry",
-        epilog="To work requires settings in the INI file",
         formatter_class=argparse.RawTextHelpFormatter)
-    parser.add_argument(
-        "-i",
-        "--ini",
-        help="use this INI file (default: {})".format(config_name),
-        metavar="FILE")
-    parser.add_argument(
-        "-r",
-        "--repository",
-        action='append',
-        default=[],
-        help="scan only these repositories (one or more)",
-        metavar="namespace/project")
+    parser.add_argument("--jwt-url", required=True)
+    parser.add_argument("--registry-url", required=True)
+    parser.add_argument("--repository", required=True)
     parser.add_argument(
         "-t",
         "--tag-match",
         help="only consider tags containing the string",
         metavar="SNAPSHOT")
     parser.add_argument(
-        "-m",
-        "--minimum",
-        help="minimum allowed number of images in repository (overrides INI value)",
+        "--hours",
+        help="delete images older than this many hours",
         metavar="X",
-        type=int)
-    parser.add_argument(
-        "-d",
-        "--days",
-        help="delete images older than this time (overrides INI value)",
-        metavar="X",
+        required=True,
         type=int)
     parser.add_argument(
         "--clean-all",
         action="store_true",
         help="delete all images in repository (DANGER!)")
+    parser.add_argument(
+        "--user",
+        required=True,
+        help="gitlab registry user")
+    parser.add_argument(
+        "--password",
+        required=True,
+        help="gitlab registry password")
     parser.add_argument(
         "--dry-run", action="store_true", help="not delete actually")
     parser.add_argument(
@@ -156,48 +142,26 @@ if __name__ == "__main__":
     else:
         logging.basicConfig(level=logging.WARNING, format=log_format)
 
-    if args.ini:
-        if os.path.isfile(args.ini):
-            config_name = args.ini
-        else:
-            logging.critical("Config {} not found!".format(args.ini))
-            sys.exit(1)
-
     if args.insecure:
         requests.packages.urllib3.disable_warnings()
 
-    config = configparser.ConfigParser()
-    config.read(config_name)
-
     GRICleaner = GitlabRegistryClient(
-        auth=(config["Gitlab"]["User"], config["Gitlab"]["Password"]),
-        jwt=config["Gitlab"]["JWT URL"],
-        registry=config["Gitlab"]["Registry URL"],
+        auth=(args.user, args.password),
+        jwt=args.jwt_url,
+        registry=args.registry_url,
         requests_verify=not args.insecure,
         dry_run=args.dry_run)
-    minimum_images = args.minimum if args.minimum else int(config["Cleanup"]["Minimum Images"])
-    retention_days = args.days if args.days else int(config["Cleanup"]["Retention Days"])
 
-    today = datetime.datetime.today()
+    retention_hours = args.hours
 
-    if args.repository:
-        catalog = args.repository
+    now = datetime.datetime.utcnow()
+
+    logging.info("SCAN repository: {}".format(args.repository))
+    tags = GRICleaner.get_tags(args.repository)
+
+    if not tags.get("tags"):
+        logging.warning("No tags found for repository {}".format(args.repository))
     else:
-        catalog = GRICleaner.get_catalog()
-        logging.debug('Fetched catalog: {}'.format(catalog))
-    logging.info("Found {} repositories".format(len(catalog)))
-    for repository in catalog:
-        logging.info("SCAN repository: {}".format(repository))
-        try:
-            tags = GRICleaner.get_tags(repository)
-        except requests.exceptions.HTTPError as e:
-            logging.warning("Encountered a HTTP error when trying to access repository {}\n{}".format(repository, e))
-            continue
-
-        if not tags.get("tags"):
-            logging.warning("No tags found for repository {}".format(repository))
-            continue
-
         logging.debug("Tags ({}): {}".format(len(tags["tags"]), tags["tags"]))
 
         if args.tag_match:
@@ -209,27 +173,28 @@ if __name__ == "__main__":
         if args.clean_all:
             logging.warning("!!! CLEAN ALL IMAGES !!!")
             for tag in filtered_tags:
-                logging.warning("- DELETE: {}:{}".format(repository, tag))
-                GRICleaner.delete_image(repository, tag)
+                logging.warning("- DELETE: {}:{}".format(args.repository, tag))
+                GRICleaner.delete_image(args.repository, tag)
         else:
-            latest = GRICleaner.get_image(repository, "latest")
+            latest = GRICleaner.get_image(args.repository, "latest")
             if "id" in latest:
                 latest_id = latest["id"]
                 if args.debug:
                     logging.debug("Latest ID: {}".format(latest_id))
             else:
                 latest_id = ""
-            if len(filtered_tags) > minimum_images:
-                for tag in filtered_tags:
-                    image = GRICleaner.get_image(repository, tag)
-                    if image and image["id"] != latest_id:
-                        created = dateutil.parser.parse(image["created"]).replace(tzinfo=None)
-                        diff = today - created
-                        logging.debug("Tag {} with image id {} days diff: {}".format(tag, image["id"], diff.days))
-                        if diff.days > retention_days:
-                            logging.warning("- DELETE: {}:{}, Created at {}, ({} days ago)".
-                                            format(repository,
-                                                   tag,
-                                                   created.replace(microsecond=0),
-                                                   diff.days))
-                            GRICleaner.delete_image(repository, tag)
+
+            for tag in filtered_tags:
+                image = GRICleaner.get_image(args.repository, tag)
+                if image and image["id"] != latest_id:
+                    created = datetime.datetime.strptime(image["created"][:-4], "%Y-%m-%dT%H:%M:%S.%f")
+                    delta = now - created
+                    hours_delta = delta.total_seconds() / 60 / 60
+                    logging.debug("Tag {} with image id {}, created {} hours ago.".format(tag, image["id"], hours_delta))
+                    if hours_delta >= retention_hours:
+                        logging.warning("- DELETE: {}:{}, Created at {}, ({} hours ago)".
+                                        format(args.repository,
+                                               tag,
+                                               created.replace(microsecond=0),
+                                               hours_delta))
+                        GRICleaner.delete_image(args.repository, tag)
